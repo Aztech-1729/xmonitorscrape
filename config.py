@@ -37,7 +37,7 @@ BROWSER_ARGS = [
 ]
 
 # Scraping Settings
-PAGE_POOL_SIZE = 7
+PAGE_POOL_SIZE = 4
 MAX_SCROLL_COUNT = 2
 SCRAPE_TWEET_LIMIT = 5  # how many latest tweets to parse per profile
 SCRAPE_TIMEOUT = 18000  # milliseconds (VPS-safe; heavy profiles can be slow)
@@ -49,3 +49,4 @@ MAX_MONITORED_USERS = 50
 # File Paths
 DATA_FILE = "data.json"
 COOKIE_FILE = "session1.json"
+
