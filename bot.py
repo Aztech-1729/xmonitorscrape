@@ -216,11 +216,16 @@ class TwitterScraper:
                     await page.evaluate("window.scrollBy(0, 800)")
                     await asyncio.sleep(0.8)
 
-                return await page.evaluate("""
-                    () => {
+                limit = int(getattr(config, "SCRAPE_TWEET_LIMIT", 5))
+
+                return await page.evaluate(
+                    """
+                    (limit) => {
                         const results = [];
                         const articles = document.querySelectorAll('article[data-testid="tweet"]');
-                        for (let i = 0; i < Math.min(3, articles.length); i++) {
+                        const n = Math.min(limit || 0, articles.length);
+
+                        for (let i = 0; i < n; i++) {
                             const article = articles[i];
                             try {
                                 const tweetData = {
@@ -230,16 +235,16 @@ class TwitterScraper:
                                     link: '',
                                     tweet_id: '',
                                     is_retweet: false,
+                                    is_pinned: false,
                                     original_author: '',
                                     timestamp: Date.now()
                                 };
 
                                 const socialContext = article.querySelector('[data-testid="socialContext"]');
                                 if (socialContext) {
-                                    const contextText = socialContext.textContent.toLowerCase();
-                                    if (contextText.includes('repost') || contextText.includes('retweet')) {
-                                        tweetData.is_retweet = true;
-                                    }
+                                    const contextText = (socialContext.textContent || '').toLowerCase();
+                                    if (contextText.includes('pinned')) tweetData.is_pinned = true;
+                                    if (contextText.includes('repost') || contextText.includes('retweet')) tweetData.is_retweet = true;
                                 }
 
                                 const tweetTextEl = article.querySelector('[data-testid="tweetText"]');
@@ -298,9 +303,12 @@ class TwitterScraper:
                                 if (tweetData.tweet_id) results.push(tweetData);
                             } catch (e) {}
                         }
+
                         return results;
                     }
-                """)
+                    """,
+                    limit,
+                )
 
             # Attempts: initial + recovery retries
             for attempt in range(retries + 1):
@@ -383,19 +391,25 @@ class MonitoringService:
             # tweets are returned newest->older (top of timeline first)
             print(f"✅ Found {len(tweets)} tweet(s) for @{username}")
 
+            # Ignore pinned tweets completely (they are old and always appear at top)
+            tweets_non_pinned = [t for t in tweets if not t.get('is_pinned')]
+            if not tweets_non_pinned:
+                print(f"   ⚠️ Only pinned tweets visible for @{username}, skipping")
+                return
+
             data = await self.data_manager.read()
             last_seen = data['last_seen'].get(username)
 
             if last_seen is None:
-                # Baseline: set latest tweet id, do not send old tweets
-                latest_id = tweets[0]['tweet_id']
+                # Baseline: set latest NON-PINNED tweet id, do not send old tweets
+                latest_id = tweets_non_pinned[0]['tweet_id']
                 print(f"   📝 First time monitoring @{username}, setting baseline to {latest_id}")
                 await self.data_manager.update_last_seen(username, latest_id)
                 return
 
-            # Collect all tweets newer than last_seen (within our scraped window)
+            # Collect all non-pinned tweets newer than last_seen (within our scraped window)
             new_tweets: List[dict] = []
-            for t in tweets:
+            for t in tweets_non_pinned:
                 if t.get('tweet_id') == last_seen:
                     break
                 new_tweets.append(t)
