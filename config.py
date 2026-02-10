@@ -39,7 +39,9 @@ BROWSER_ARGS = [
 # Scraping Settings
 PAGE_POOL_SIZE = 7
 MAX_SCROLL_COUNT = 2
-SCRAPE_TIMEOUT = 12000  # milliseconds (VPS-safe; navigation can be slow)
+SCRAPE_TIMEOUT = 18000  # milliseconds (VPS-safe; heavy profiles can be slow)
+TWEET_WAIT_TIMEOUT = 10000  # milliseconds to wait for tweet articles
+SCRAPE_RETRIES = 2  # additional recovery retries when tweets aren't found
 DEFAULT_POLL_INTERVAL = 90  # seconds (optimized for 50 users)
 MAX_MONITORED_USERS = 50
 
