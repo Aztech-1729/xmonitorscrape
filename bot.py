@@ -152,173 +152,71 @@ class TwitterScraper:
         try:
             url = f"https://x.com/{username}"
 
-            async def load_and_wait_for_tweets() -> bool:
-                # VPS/slow networks: navigation + rendering can exceed SCRAPE_TIMEOUT.
-                await page.goto(url, wait_until="domcontentloaded", timeout=max(15000, config.SCRAPE_TIMEOUT))
-                # Give the client-side app time to render
-                await asyncio.sleep(1.5)
+            wait_timeout = int(getattr(config, "TWEET_WAIT_TIMEOUT", 6000))
+            retries = int(getattr(config, "SCRAPE_RETRIES", 1))
+            nav_timeout = int(getattr(config, "SCRAPE_TIMEOUT", 15000))
+
+            async def detect_state() -> str:
+                """Best-effort detection of common X interstitial/error states."""
                 try:
-                    await page.wait_for_selector('article[data-testid="tweet"]', timeout=6000)
+                    u = (page.url or "").lower()
+                except Exception:
+                    u = ""
+
+                if "login" in u or "i/flow" in u:
+                    return "login"
+
+                try:
+                    title = (await page.title()).lower()
+                except Exception:
+                    title = ""
+
+                # Common strings
+                try:
+                    body_text = (await page.locator("body").inner_text()).lower()
+                except Exception:
+                    body_text = ""
+
+                if "something went wrong" in body_text or "try again" in body_text:
+                    return "error_try_again"
+                if "rate limit" in body_text or "too many requests" in body_text:
+                    return "rate_limited"
+                if "protected" in body_text and "tweets" in body_text:
+                    return "protected"
+                if "confirm you’re human" in body_text or "confirm you're human" in body_text:
+                    return "human_check"
+                if "javascript" in body_text and "enabled" in body_text:
+                    return "js_disabled"
+
+                # Fallback
+                return "unknown"
+
+            async def try_click_retry():
+                # Click buttons like "Try again" if present
+                for text in ("Try again", "Retry", "Reload"):
+                    try:
+                        btn = page.get_by_role("button", name=text)
+                        if await btn.count() > 0:
+                            await btn.first.click(timeout=2000)
+                            await asyncio.sleep(1)
+                            return
+                    except Exception:
+                        continue
+
+            async def wait_for_tweets() -> bool:
+                try:
+                    await page.wait_for_selector('article[data-testid="tweet"]', timeout=wait_timeout)
                     return True
                 except Exception:
                     return False
 
-            loaded = await load_and_wait_for_tweets()
+            async def extract() -> List[Dict]:
+                # Small scroll to trigger lazy load
+                for _ in range(config.MAX_SCROLL_COUNT):
+                    await page.evaluate("window.scrollBy(0, 800)")
+                    await asyncio.sleep(0.8)
 
-            if not loaded:
-                # Retry once (common on VPS due to delayed rendering / transient throttling)
-                try:
-                    await page.reload(wait_until="domcontentloaded", timeout=max(15000, config.SCRAPE_TIMEOUT))
-                except Exception:
-                    # If reload fails, try one more goto
-                    await page.goto(url, wait_until="domcontentloaded", timeout=max(15000, config.SCRAPE_TIMEOUT))
-
-                await asyncio.sleep(2)
-                try:
-                    await page.wait_for_selector('article[data-testid="tweet"]', timeout=6000)
-                except Exception:
-                    pass
-
-            # Small scroll to trigger lazy load (even if tweets exist)
-            for _ in range(config.MAX_SCROLL_COUNT):
-                await page.evaluate("window.scrollBy(0, 800)")
-                await asyncio.sleep(0.8)
-
-            tweets = await page.evaluate("""
-                () => {
-                    const results = [];
-                    const articles = document.querySelectorAll('article[data-testid="tweet"]');
-                    
-                    for (let i = 0; i < Math.min(3, articles.length); i++) {
-                        const article = articles[i];
-                        try {
-                            const tweetData = {
-                                text: '',
-                                images: [],
-                                videos: [],
-                                link: '',
-                                tweet_id: '',
-                                is_retweet: false,
-                                original_author: '',
-                                timestamp: Date.now()
-                            };
-                            
-                            // Check for retweet/repost - improved detection
-                            const socialContext = article.querySelector('[data-testid="socialContext"]');
-                            if (socialContext) {
-                                const contextText = socialContext.textContent.toLowerCase();
-                                if (contextText.includes('repost') || contextText.includes('retweet')) {
-                                    tweetData.is_retweet = true;
-                                }
-                            }
-                            
-                            // Get tweet text
-                            const tweetTextEl = article.querySelector('[data-testid="tweetText"]');
-                            if (tweetTextEl) {
-                                tweetData.text = tweetTextEl.innerText;
-                            }
-                            
-                            // Get author - improved for retweets/reposts
-                            if (tweetData.is_retweet) {
-                                const userNameSection = article.querySelector('[data-testid="User-Name"]');
-                                if (userNameSection) {
-                                    const authorLink = userNameSection.querySelector('a[role="link"][href^="/"]');
-                                    if (authorLink) {
-                                        const href = authorLink.getAttribute('href');
-                                        if (href && href !== '/' && !href.includes('/status/')) {
-                                            tweetData.original_author = href.replace('/', '').split('/')[0];
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Get tweet link and ID
-                            const timeEl = article.querySelector('time');
-                            if (timeEl) {
-                                const link = timeEl.closest('a');
-                                if (link) {
-                                    const href = link.getAttribute('href');
-                                    if (href) {
-                                        tweetData.link = 'https://x.com' + href;
-                                        const parts = href.split('/');
-                                        const statusIdx = parts.indexOf('status');
-                                        if (statusIdx !== -1 && parts.length > statusIdx + 1) {
-                                            tweetData.tweet_id = parts[statusIdx + 1];
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Get images
-                            const imgEls = article.querySelectorAll('[data-testid="tweetPhoto"] img');
-                            imgEls.forEach(img => {
-                                const src = img.getAttribute('src');
-                                if (src && src.includes('pbs.twimg.com')) {
-                                    tweetData.images.push(src);
-                                }
-                            });
-                            
-                            // Get videos - improved with multiple strategies
-                            const videoEls = article.querySelectorAll('video');
-                            videoEls.forEach(video => {
-                                let videoUrl = null;
-                                
-                                // Strategy 1: Direct src attribute
-                                const directSrc = video.getAttribute('src');
-                                if (directSrc && !directSrc.startsWith('blob:')) {
-                                    videoUrl = directSrc;
-                                }
-                                
-                                // Strategy 2: Source element
-                                if (!videoUrl) {
-                                    const source = video.querySelector('source');
-                                    if (source) {
-                                        const sourceSrc = source.getAttribute('src');
-                                        if (sourceSrc && !sourceSrc.startsWith('blob:')) {
-                                            videoUrl = sourceSrc;
-                                        }
-                                    }
-                                }
-                                
-                                // Strategy 3: Poster attribute as fallback indicator
-                                if (!videoUrl) {
-                                    const poster = video.getAttribute('poster');
-                                    if (poster && poster.includes('pbs.twimg.com')) {
-                                        // Video exists but URL not accessible via DOM
-                                        // Tweet link preview will handle it
-                                    }
-                                }
-                                
-                                if (videoUrl) {
-                                    tweetData.videos.push(videoUrl);
-                                }
-                            });
-                            
-                            if (tweetData.tweet_id) {
-                                results.push(tweetData);
-                            }
-                        } catch (e) {
-                            console.error('Error parsing tweet:', e);
-                        }
-                    }
-                    
-                    return results;
-                }
-            """)
-            
-            if tweets:
-                return tweets
-
-            # If still no tweets, do one last soft refresh + re-check quickly.
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=max(15000, config.SCRAPE_TIMEOUT))
-                await asyncio.sleep(2)
-                try:
-                    await page.wait_for_selector('article[data-testid="tweet"]', timeout=5000)
-                except Exception:
-                    pass
-
-                tweets = await page.evaluate("""
+                return await page.evaluate("""
                     () => {
                         const results = [];
                         const articles = document.querySelectorAll('article[data-testid="tweet"]');
@@ -345,9 +243,7 @@ class TwitterScraper:
                                 }
 
                                 const tweetTextEl = article.querySelector('[data-testid="tweetText"]');
-                                if (tweetTextEl) {
-                                    tweetData.text = tweetTextEl.innerText;
-                                }
+                                if (tweetTextEl) tweetData.text = tweetTextEl.innerText;
 
                                 if (tweetData.is_retweet) {
                                     const userNameSection = article.querySelector('[data-testid="User-Name"]');
@@ -381,44 +277,63 @@ class TwitterScraper:
                                 const imgEls = article.querySelectorAll('[data-testid="tweetPhoto"] img');
                                 imgEls.forEach(img => {
                                     const src = img.getAttribute('src');
-                                    if (src && src.includes('pbs.twimg.com')) {
-                                        tweetData.images.push(src);
-                                    }
+                                    if (src && src.includes('pbs.twimg.com')) tweetData.images.push(src);
                                 });
 
                                 const videoEls = article.querySelectorAll('video');
                                 videoEls.forEach(video => {
                                     let videoUrl = null;
                                     const directSrc = video.getAttribute('src');
-                                    if (directSrc && !directSrc.startsWith('blob:')) {
-                                        videoUrl = directSrc;
-                                    }
+                                    if (directSrc && !directSrc.startsWith('blob:')) videoUrl = directSrc;
                                     if (!videoUrl) {
                                         const source = video.querySelector('source');
                                         if (source) {
                                             const sourceSrc = source.getAttribute('src');
-                                            if (sourceSrc && !sourceSrc.startsWith('blob:')) {
-                                                videoUrl = sourceSrc;
-                                            }
+                                            if (sourceSrc && !sourceSrc.startsWith('blob:')) videoUrl = sourceSrc;
                                         }
                                     }
-                                    if (videoUrl) {
-                                        tweetData.videos.push(videoUrl);
-                                    }
+                                    if (videoUrl) tweetData.videos.push(videoUrl);
                                 });
 
-                                if (tweetData.tweet_id) {
-                                    results.push(tweetData);
-                                }
+                                if (tweetData.tweet_id) results.push(tweetData);
                             } catch (e) {}
                         }
                         return results;
                     }
-                """);
+                """)
 
-                return tweets or []
-            except Exception:
-                return []
+            # Attempts: initial + recovery retries
+            for attempt in range(retries + 1):
+                try:
+                    if attempt == 0:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=max(15000, nav_timeout))
+                    else:
+                        # recovery attempt: reload then goto
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=max(15000, nav_timeout))
+                        except Exception:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=max(15000, nav_timeout))
+
+                    await asyncio.sleep(1.5 + attempt)
+
+                    # Wait for tweets
+                    await wait_for_tweets()
+
+                    tweets = await extract()
+                    if tweets:
+                        return tweets
+
+                    state = await detect_state()
+                    print(f"⚠️  @{username}: tweets=0, state={state}, attempt={attempt+1}/{retries+1}")
+
+                    if state in ("error_try_again", "unknown"):
+                        await try_click_retry()
+                    # If login/human_check/protected, retries won't help much.
+
+                except Exception as e:
+                    print(f"Error scraping {username} (attempt {attempt+1}): {e}")
+
+            return []
 
         except Exception as e:
             print(f"Error scraping {username}: {e}")
