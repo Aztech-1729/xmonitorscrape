@@ -1,0 +1,9 @@
+{
+  "settings": {
+    "poll_seconds": 90,
+    "monitoring_active": false
+  },
+  "targets": [],
+  "keywords": [],
+  "last_seen": {}
+}
